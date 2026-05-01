@@ -49,7 +49,7 @@ The BFM dense mesh has 38,365 vertices. We select 468 of them using **Farthest P
 Clone this fork and follow the original installation instructions:
 
 ```bash
-git clone https://github.com/yourusername/3DDFA_V2.git
+git clone https://github.com/conleypj17/3DDFA_V2.git
 cd 3DDFA_V2
 ```
 

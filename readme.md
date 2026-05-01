@@ -1,221 +1,247 @@
-# Towards Fast, Accurate and Stable 3D Dense Face Alignment
+# 3DDFA_V2 — Facial Motion Analysis Pipeline
 
-[![License](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
-![GitHub repo size](https://img.shields.io/github/repo-size/cleardusk/3DDFA_V2.svg)
-[![](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1OKciI0ETCpWdRjP-VOGpBulDJojYfgWv)
+This is a fork of [cleardusk/3DDFA_V2](https://github.com/cleardusk/3DDFA_V2) with a custom facial motion analysis pipeline added on top. The original 3DDFA_V2 code is unchanged — all additions are new files that sit alongside the existing repo structure.
 
-By [Jianzhu Guo](https://guojianzhu.com), [Xiangyu Zhu](http://www.cbsr.ia.ac.cn/users/xiangyuzhu/), [Yang Yang](http://www.cbsr.ia.ac.cn/users/yyang/main.htm), Fan Yang, [Zhen Lei](http://www.cbsr.ia.ac.cn/users/zlei/) and [Stan Z. Li](https://scholar.google.com/citations?user=Y-nyLGIAAAAJ).
-The code repo is owned and maintained by **[Jianzhu Guo](https://guojianzhu.com)**.
+The pipeline extracts per-region facial motion (position, velocity, acceleration), global head pose (roll, pitch, yaw), and 468 canonical 3D/2D landmarks from video frames stored as PNG sequences. It was designed for footage captured at distances ranging from **1 metre to 5 metres** from the camera.
 
+---
 
-<p align="center">
-  <img src="docs/images/webcam.gif" alt="demo" width="512px">
-</p>
+## What was added
 
+| File | Description |
+|---|---|
+| `analyse_video4.py` | Main entry point. Run this on a folder of PNG frames. |
+| `utils/region_motion.py` | Computes per-region centroids, nose subtraction, velocity, and acceleration from 68-point sparse landmarks. |
+| `utils/fps_points.py` | Runs Farthest Point Sampling on the BFM dense mesh to select 468 canonical landmark points. Run once to generate the index. |
+| `process_frames.py` | Utility for preprocessing video into PNG frame sequences before running the main pipeline. |
+| `bfm_468_indices.json` | Pre-generated 468-point index file. **You do not need to regenerate this** unless you want a different point distribution. |
+| `bfm_468_pointmap.json` | Shareable reference file mapping each of the 468 point IDs to their 3D position on the BFM mean face. Share this with collaborators using other face tracking methods so they can find equivalent points in their own mesh. |
 
-**\[Updates\]**
- - `2021.7.10`: Run 3DDFA_V2 online on [Gradio](https://gradio.app/hub/AK391/3DDFA_V2).
- - `2021.1.15`: Borrow the implementation of [Dense-Head-Pose-Estimation](https://github.com/1996scarlet/Dense-Head-Pose-Estimation) for the faster mesh rendering (speedup about 3x, 15ms -> 4ms), see [utils/render_ctypes.py](./utils/render_ctypes.py) for details.
- - `2020.10.7`: Add the latency evaluation of the full pipeline in [latency.py](./latency.py), just run by `python3 latency.py --onnx`, see [Latency](#Latency) evaluation for details.
- - `2020.10.6`: Add onnxruntime support for FaceBoxes to reduce the face detection latency, just append the `--onnx` action to activate it, see [FaceBoxes_ONNX.py](FaceBoxes/FaceBoxes_ONNX.py) for details.
- - `2020.10.2`: **Add onnxruntime support to greatly reduce the 3dmm parameters inference latency**, just append the `--onnx` action when running `demo.py`, see [TDDFA_ONNX.py](./TDDFA_ONNX.py) for details.
- - `2020.9.20`: Add features including pose estimation and serializations to .ply and .obj, see `pose`, `ply`, `obj` options in [demo.py](./demo.py).
- - `2020.9.19`: Add PNCC (Projected Normalized Coordinate Code), uv texture mapping features, see `pncc`, `uv_tex` options in [demo.py](./demo.py).
+---
 
+## How it works
 
-## Introduction
+### Overview
 
-This work extends [3DDFA](https://github.com/cleardusk/3DDFA), named **3DDFA_V2**, titled [Towards Fast, Accurate and Stable 3D Dense Face Alignment](https://guojianzhu.com/assets/pdfs/3162.pdf), accepted by [ECCV 2020](https://eccv2020.eu/). The supplementary material is [here](https://guojianzhu.com/assets/pdfs/3162-supp.pdf). The [gif](./docs/images/webcam.gif) above shows a webcam demo of the tracking result, in the scenario of my lab. This repo is the official implementation of 3DDFA_V2.
+3DDFA_V2 fits a parametric 3D face model (the Basel Face Model, BFM) to each video frame. Every point on that model has a consistent 3D position regardless of which person is being tracked, which makes it possible to compare motion across subjects and distances.
 
-Compared to [3DDFA](https://github.com/cleardusk/3DDFA), 3DDFA_V2 achieves better performance and stability. Besides, 3DDFA_V2 incorporates the fast face detector [FaceBoxes](https://github.com/zisianw/FaceBoxes.PyTorch) instead of Dlib. A simple 3D render written by c++ and cython is also included. This repo supports the onnxruntime, and the latency of regressing 3DMM parameters using the default backbone is about **1.35ms/image on CPU** with a single image as input. If you are interested in this repo, just try it on this **[google colab](https://colab.research.google.com/drive/1OKciI0ETCpWdRjP-VOGpBulDJojYfgWv)**! Welcome for valuable issues, PRs and discussions 😄
+The pipeline runs in two stages per frame:
 
-<!-- Currently, the pre-trained model, inference code and some utilities are released.  -->
+1. **Face detection** — finds the face bounding box in the image (FaceBoxes or SCRFD)
+2. **3DMM regression** — fits the BFM model to the detected face crop and recovers 3D landmark positions
 
-## Getting started
+Velocity and acceleration are then computed from the landmark positions across frames using finite differences.
 
-### Requirements
-See [requirements.txt](./requirements.txt), tested on macOS and Linux platforms. The Windows users may refer to [FQA](#FQA) for building issues. Note that this repo uses Python3. The major dependencies are PyTorch, numpy, opencv-python and onnxruntime, etc. If you run the demos with `--onnx` flag to do acceleration, you may need to install `libomp` first, i.e., `brew install libomp` on macOS.
+### Nose subtraction
 
-### Usage
+All 3D landmark positions are expressed **relative to the nose tip**, not in absolute model space. This removes global head translation from the signal — so if a person turns their head, the motion of the lip region reflects only the lips moving, not the whole head moving. This is the same approach used in MediaPipe-based pipelines.
 
-1. Clone this repo
-   
-```shell script
-git clone https://github.com/cleardusk/3DDFA_V2.git
+### The 468-point set
+
+The BFM dense mesh has 38,365 vertices. We select 468 of them using **Farthest Point Sampling (FPS)**, biased toward the five regions of interest (right eye, left eye, lips, right cheek, left cheek) to ensure good coverage where it matters. The selected indices are saved in `bfm_468_indices.json` and are fixed — the same 468 points are used on every run, making outputs comparable across videos.
+
+---
+
+## Setup
+
+### 1. Follow the original 3DDFA_V2 setup
+
+Clone this fork and follow the original installation instructions:
+
+```bash
+git clone https://github.com/yourusername/3DDFA_V2.git
 cd 3DDFA_V2
 ```
 
-2. Build the cython version of NMS, Sim3DR, and the faster mesh render
-<!-- ```shell script
-cd FaceBoxes
-sh ./build_cpu_nms.sh
-cd ..
+Install dependencies and build the Cython extensions:
 
-cd Sim3DR
-sh ./build_sim3dr.sh
-cd ..
-
-# the faster mesh render
-cd utils/asset
-gcc -shared -Wall -O3 render.c -o render.so -fPIC
-cd ../..
+```bash
+pip install -r requirements.txt
+sh build.sh
 ```
 
-or simply build them by -->
-```shell script
-sh ./build.sh
+Download the pretrained model weights as described in the original README.
+
+> **NumPy version note:** The FaceBoxes Cython extension requires NumPy < 2.0. If you have a newer NumPy installed, downgrade it before building:
+> ```bash
+> pip install "numpy<2"
+> sh build.sh
+> ```
+
+### 2. Install additional dependencies for SCRFD (optional)
+
+Only needed if you want to use the SCRFD detector (recommended for footage at 4–5 metres):
+
+```bash
+pip install insightface onnxruntime
 ```
 
-3. Run demos
+Model weights for SCRFD (~10MB) are downloaded automatically on first use and cached in `~/.insightface/models/`.
 
-```shell script
-# 1. running on still image, the options include: 2d_sparse, 2d_dense, 3d, depth, pncc, pose, uv_tex, ply, obj
-python3 demo.py -f examples/inputs/emma.jpg --onnx # -o [2d_sparse, 2d_dense, 3d, depth, pncc, pose, uv_tex, ply, obj]
+---
 
-# 2. running on videos
-python3 demo_video.py -f examples/inputs/videos/214.avi --onnx
+## Running the pipeline
 
-# 3. running on videos smoothly by looking ahead by `n_next` frames
-python3 demo_video_smooth.py -f examples/inputs/videos/214.avi --onnx
+### Input format
 
-# 4. running on webcam
-python3 demo_webcam_smooth.py --onnx
+The pipeline expects a **directory of PNG images**, one per frame, named so that alphabetical sorting matches frame order (e.g. `frame_0000.png`, `frame_0001.png`, ...). Use `process_frames.py` to convert a video file into this format if needed.
+
+### Basic usage
+
+```bash
+python analyse_video4.py -f path/to/png/directory --onnx
 ```
 
-The implementation of tracking is simply by alignment. If the head pose > 90° or the motion is too fast, the alignment may fail. A threshold is used to trickly check the tracking state, but it is unstable.
+### With SCRFD detector (recommended for 4–5 metre footage)
 
-You can refer to [demo.ipynb](./demo.ipynb) or [google colab](https://colab.research.google.com/drive/1OKciI0ETCpWdRjP-VOGpBulDJojYfgWv) for the step-by-step tutorial of running on the still image.
+```bash
+python analyse_video4.py -f path/to/png/directory --onnx --detector scrfd
+```
 
-For example, running `python3 demo.py -f examples/inputs/emma.jpg -o 3d` will give the result below:
+### All arguments
 
-<p align="center">
-  <img src="docs/images/emma_3d.jpg" alt="demo" width="640px">
-</p>
+| Argument | Default | Description |
+|---|---|---|
+| `-f` / `--input` | required | Path to directory containing PNG frames |
+| `--onnx` | off | Use ONNX runtime for the 3DMM regressor. Significantly faster on CPU — recommended. |
+| `--detector` | `facebox` | Face detector. `facebox` is the default. Use `scrfd` for small/distant faces (4–5m). |
+| `--fps` | `30.0` | Frame rate of the source video. Used for velocity/acceleration units. |
+| `--config` | `configs/mb1_120x120.yml` | 3DDFA model config file. |
+| `--point_index` | `bfm_468_indices.json` | Path to the 468-point index file. |
 
-Another example:
+### Example with all options
 
-<p align="center">
-  <img src="docs/images/trump_biden_3d.jpg" alt="demo" width="640px">
-</p>
+```bash
+python analyse_video4.py \
+    -f /data/subject1/vid_3m_nodding/ \
+    --onnx \
+    --detector scrfd \
+    --fps 30
+```
 
-Running on a video will give:
+---
 
-<p align="center">
-  <img src="docs/images/out.gif" alt="demo" width="512px">
-</p>
+## Output files
 
-More results or demos to see: [Hathaway](https://guojianzhu.com/assets/videos/hathaway_3ddfa_v2.mp4).
+All output CSVs are saved **inside the input directory**, prefixed with the directory name. For an input folder called `vid_3m_nodding`, the outputs are:
 
-<!-- Obviously, the eyes parts are not good. -->
+```
+vid_3m_nodding/
+├── vid_3m_nodding_landmarks.csv
+├── vid_3m_nodding_pose.csv
+├── vid_3m_nodding_lips.csv
+├── vid_3m_nodding_left_eye.csv
+├── vid_3m_nodding_right_eye.csv
+├── vid_3m_nodding_left_cheek.csv
+└── vid_3m_nodding_right_cheek.csv
+```
 
-### Features (up to now)
+---
 
+### `_landmarks.csv`
 
-<table>
-  <tr>
-    <th>2D sparse</th>
-    <th>2D dense</th>
-    <th>3D</th>
-  </tr>
+One row per frame. Contains all 468 tracked points, each with 5 values:
 
-  <tr>
-    <td><img src="docs/images/trump_hillary_2d_sparse.jpg" width="360" alt="2d sparse"></td>
-    <td><img src="docs/images/trump_hillary_2d_dense.jpg"  width="360" alt="2d dense"></td>
-    <td><img src="docs/images/trump_hillary_3d.jpg"        width="360" alt="3d"></td>
-  </tr>
+| Column pattern | Description |
+|---|---|
+| `pt0_x`, `pt0_y`, `pt0_z` | 3D position in BFM model space, **relative to the nose tip**, in micrometers. X is left/right (negative = left of nose), Y is up/down (negative = above nose), Z is depth (positive = toward camera). |
+| `pt0_px`, `pt0_py` | 2D pixel coordinates in the original image frame. Origin is the top-left corner of the image. X increases rightward, Y increases downward. |
 
-  <tr>
-    <th>Depth</th>
-    <th>PNCC</th>
-    <th>UV texture</th>
-  </tr>
+This repeats for `pt0` through `pt467`, giving **2,341 columns** total (1 frame column + 468 × 5).
 
-  <tr>
-    <td><img src="docs/images/trump_hillary_depth.jpg"     width="360" alt="depth"></td>
-    <td><img src="docs/images/trump_hillary_pncc.jpg"      width="360" alt="pncc"></td>
-    <td><img src="docs/images/trump_hillary_uv_tex.jpg"    width="360" alt="uv_tex"></td>
-  </tr>
+> **3D vs 2D:** The 3D coordinates are distance-independent and suitable for comparing motion across the 1–5m distance range. The 2D pixel coordinates are absolute image positions — they will differ across distances as the face appears at different sizes and locations in the frame. Use 2D coords for visualisation and as input for downstream depth estimation.
 
-  <tr>
-    <th>Pose</th>
-    <th>Serialization to .ply</th>
-    <th>Serialization to .obj</th>
-  </tr>
+---
 
-  <tr>
-    <td><img src="docs/images/trump_hillary_pose.jpg"      width="360" alt="pose"></td>
-    <td><img src="docs/images/ply.jpg"                     width="360" alt="ply"></td>
-    <td><img src="docs/images/obj.jpg"                     width="360" alt="obj"></td>
-  </tr>
+### `_pose.csv`
 
-</table>
+One row per frame. Global head orientation extracted from the 3DMM transformation matrix.
 
-### Configs
+| Column | Description |
+|---|---|
+| `frame` | Frame index |
+| `yaw` | Left/right head rotation in degrees |
+| `pitch` | Up/down head rotation in degrees |
+| `roll` | Tilt head rotation in degrees |
 
-The default backbone is MobileNet_V1 with input size 120x120 and the default pre-trained weight is `weights/mb1_120x120.pth`, shown in [configs/mb1_120x120.yml](configs/mb1_120x120.yml). This repo provides another config in [configs/mb05_120x120.yml](configs/mb05_120x120.yml), with the widen factor 0.5, being smaller and faster. You can specify the config by `-c` or `--config` option. The released models are shown in the below table. Note that the inference time on CPU in the paper is evaluated using TensorFlow.
+---
 
-| Model | Input | #Params | #Macs | Inference (TF) |
-| :-: | :-: | :-: | :-: | :-: |
-| MobileNet  | 120x120 | 3.27M | 183.5M | ~6.2ms |
-| MobileNet x0.5 | 120x120 | 0.85M | 49.5M | ~2.9ms |
+### `_lips.csv`, `_left_eye.csv`, `_right_eye.csv`, `_left_cheek.csv`, `_right_cheek.csv`
 
+One row per frame. Per-region kinematics computed from the **centroid** of each region's landmarks, after nose subtraction.
 
-**Surprisingly**, the latency of [onnxruntime](https://github.com/microsoft/onnxruntime) is much smaller. The inference time on CPU with different threads is shown below. The results are tested on my MBP (i5-8259U CPU @ 2.30GHz on 13-inch MacBook Pro), with the `1.5.1` version of onnxruntime. The thread number is set by `os.environ["OMP_NUM_THREADS"]`, see [speed_cpu.py](./speed_cpu.py) for more details.
+| Column | Description |
+|---|---|
+| `frame` | Frame index |
+| `pos_x`, `pos_y`, `pos_z` | Centroid position relative to nose tip (micrometers) |
+| `vel_x`, `vel_y`, `vel_z` | Velocity in micrometers per second |
+| `acc_x`, `acc_y`, `acc_z` | Acceleration in micrometers per second² |
 
-| Model | THREAD=1 | THREAD=2 | THREAD=4 |
-| :-: | :-: | :-: | :-: |
-| MobileNet  | 4.4ms  | 2.25ms | 1.35ms |
-| MobileNet x0.5 | 1.37ms | 0.7ms | 0.5ms |
+Velocity and acceleration are computed using `numpy.gradient` (central differences, one-sided at edges). All values are nose-subtracted — they reflect facial region motion only, not global head movement.
 
-### Latency
+**Region landmark indices (68-point BFM scheme):**
 
-The `onnx` option greatly reduces the overall **CPU** latency, but face detection still takes up most of the latency time, e.g., 15ms for a 720p image. 3DMM parameters regression takes about 1~2ms for one face, and the dense reconstruction (more than 30,000 points, i.e. 38,365) is about 1ms for one face. Tracking applications may benefit from the fast 3DMM regression speed, since detection is not needed for every frame. The latency is tested using my 13-inch MacBook Pro (i5-8259U CPU @ 2.30GHz).
+| Region | Landmark indices |
+|---|---|
+| Right eye | 36–41 |
+| Left eye | 42–47 |
+| Lips | 48–67 (inner + outer) |
+| Right cheek | 1, 2, 3 (upper jaw contour proxy) |
+| Left cheek | 13, 14, 15 (upper jaw contour proxy) |
 
-The default `OMP_NUM_THREADS` is set 4, you can specify it by setting `os.environ['OMP_NUM_THREADS'] = '$NUM'` or inserting `export OMP_NUM_THREADS=$NUM` before running the python script.
+> **Cheek note:** The 68-point BFM landmark set has no explicit cheek landmarks. The upper jaw contour points are the closest anatomical proxy and move with cheek dynamics well enough for velocity and acceleration analysis.
 
-<p align="center">
-  <img src="docs/images/latency.gif" alt="demo" width="640px">
-</p>
+---
 
-## FQA
+## Sharing with collaborators using other methods
 
-1. What is the training data?
+`bfm_468_pointmap.json` is the interoperability file. Each entry looks like:
 
-    We use [300W-LP](https://drive.google.com/file/d/0B7OEHD3T4eCkVGs0TkhUWFN6N1k/view?usp=sharing) for training. You can refer to our [paper](https://guojianzhu.com/assets/pdfs/3162.pdf) for more details about the training. Since few images are closed-eyes in the training data 300W-LP, the landmarks of eyes are not accurate when closing. The eyes part of the webcam demo are also not good.
+```json
+{
+  "point_id": 12,
+  "bfm_vertex_index": 8423,
+  "mean_face_x": -14230.5,
+  "mean_face_y": -8810.2,
+  "mean_face_z": 3200.1,
+  "region": "left_eye"
+}
+```
 
-2. Running on Windows.
+- `point_id` — the shared reference number. Your `pt12` in the landmarks CSV corresponds to `point_id: 12` here.
+- `mean_face_x/y/z` — the 3D position of this point on the BFM average face, in micrometers.
+- `region` — which facial region this point belongs to.
 
-    You can refer to [this comment](https://github.com/cleardusk/3DDFA_V2/issues/12#issuecomment-697479173) for building NMS on Windows.
+A collaborator using a different face tracking method (e.g. InsightFace) loads this file, normalizes both their landmarks and the `mean_face_x/y/z` coordinates to the same scale, and finds the nearest point in their mesh for each of the 468 entries. This gives them a `point_id`-consistent landmark set that can be compared directly to the output of this pipeline. A helper script `match_landmarks.py` is provided to do this matching.
 
-## Acknowledgement
+---
 
-* The FaceBoxes module is modified from [FaceBoxes.PyTorch](https://github.com/zisianw/FaceBoxes.PyTorch).
-* A list of previous works on 3D dense face alignment or reconstruction: [3DDFA](https://github.com/cleardusk/3DDFA), [face3d](https://github.com/YadiraF/face3d), [PRNet](https://github.com/YadiraF/PRNet).
-* Thank [AK391](https://github.com/AK391) for hosting the Gradio web app.
+## Regenerating the 468-point index (optional)
 
-## Other implementations or applications
+The `bfm_468_indices.json` file is already committed and ready to use. You only need to regenerate it if you want a different point distribution or different region budgets. To regenerate:
 
-* [Dense-Head-Pose-Estimation](https://github.com/1996scarlet/Dense-Head-Pose-Estimation): Tensorflow Lite framework for face mesh, head pose, landmarks, and more.
-* [HeadPoseEstimate](https://github.com/bubingy/HeadPoseEstimate): Head pose estimation system based on 3d facial landmarks.
-* [img2pose](https://github.com/vitoralbiero/img2pose): Borrow the renderer implementation of Sim3DR in this repo.
+```bash
+python -c "from utils.fps_points import build_and_save_point_index; build_and_save_point_index()"
+```
 
-## Citation
+This overwrites both `bfm_468_indices.json` and `bfm_468_pointmap.json`. If you share regenerated files with collaborators, make sure everyone is using the same version — the `point_id` numbers will change if the index is regenerated.
 
-If your work or research benefits from this repo, please cite two bibs below : ) and 🌟 this repo.
+---
 
-    @inproceedings{guo2020towards,
-        title =        {Towards Fast, Accurate and Stable 3D Dense Face Alignment},
-        author =       {Guo, Jianzhu and Zhu, Xiangyu and Yang, Yang and Yang, Fan and Lei, Zhen and Li, Stan Z},
-        booktitle =    {Proceedings of the European Conference on Computer Vision (ECCV)},
-        year =         {2020}
-    }
+## Detector choice guide
 
-    @misc{3ddfa_cleardusk,
-        author =       {Guo, Jianzhu and Zhu, Xiangyu and Lei, Zhen},
-        title =        {3DDFA},
-        howpublished = {\url{https://github.com/cleardusk/3DDFA}},
-        year =         {2018}
-    }
+| Distance | Recommended detector |
+|---|---|
+| 1–2 metres | `facebox` (default, no extra dependencies) |
+| 3 metres | Either works, `facebox` is fine |
+| 4–5 metres | `scrfd` strongly recommended |
 
-## Contact
-**Jianzhu Guo (郭建珠)** [[Homepage](https://guojianzhu.com), [Google Scholar](https://scholar.google.com/citations?user=W8_JzNcAAAAJ&hl=en&oi=ao)]: **guojianzhu1994@foxmail.com** or **guojianzhu1994@gmail.com** or **jianzhu.guo@nlpr.ia.ac.cn** (this email will be invalid soon).
+SCRFD is better at detecting small faces (down to ~16px wide) and is actually faster than FaceBoxes in most benchmarks. The only reason not to use it by default is the additional `insightface` dependency.
+
+---
+
+## Original 3DDFA_V2
+
+All credit for the underlying 3D face reconstruction goes to the original authors. Please cite their work if you use this in research:
+
+> Guo, J., Zhu, X., Yang, Y., Yang, F., Lei, Z., & Li, S. Z. (2020). Towards Fast, Accurate and Stable 3D Dense Face Alignment. ECCV 2020.
